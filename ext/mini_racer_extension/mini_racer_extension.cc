@@ -38,6 +38,7 @@ public:
     bool added_gc_cb;
     pid_t pid;
     VALUE mutex;
+    Global<ObjectTemplate> ruby_error_template;
 
     class Lock {
         VALUE &mutex;
@@ -106,6 +107,8 @@ private:
 typedef struct {
     IsolateInfo* isolate_info;
     Persistent<Context>* context;
+    Global<Object> ruby_error_prototype;
+    Global<Function> capture_stack_trace;
 } ContextInfo;
 
 typedef struct {
@@ -929,6 +932,12 @@ void IsolateInfo::init(SnapshotInfo* snapshot_info) {
     }
 
     isolate = Isolate::New(create_params);
+
+    Locker lock { isolate };
+    HandleScope scope { isolate };
+    Local<ObjectTemplate> rubyErrorTemplate = ObjectTemplate::New(isolate);
+    rubyErrorTemplate->SetInternalFieldCount(1);
+    this->ruby_error_template.Reset(isolate, rubyErrorTemplate);
 }
 
 static VALUE rb_isolate_init_with_snapshot(VALUE self, VALUE snapshot) {
@@ -982,6 +991,10 @@ static VALUE rb_isolate_pump_message_loop(VALUE self) {
     }
 }
 
+static void NoRubyErrorConstructor(const FunctionCallbackInfo<Value>& args) {
+    args.GetIsolate()->ThrowError("This class may not be constructed from JS!");
+}
+
 static VALUE rb_context_init_unsafe(VALUE self, VALUE isolate, VALUE snap) {
     ContextInfo* context_info;
     TypedData_Get_Struct(self, ContextInfo, &context_type, context_info);
@@ -1014,8 +1027,44 @@ static VALUE rb_context_init_unsafe(VALUE self, VALUE isolate, VALUE snap) {
 
         Local<Context> context = Context::New(isolate_info->isolate);
 
+        Context::Scope context_scope { context };
+
         context_info->context = new Persistent<Context>();
         context_info->context->Reset(isolate_info->isolate, context);
+
+        Local<String> strClassName = String::NewFromUtf8(isolate_info->isolate, "RubyError").ToLocalChecked();
+
+        /* Create `RubyError` constructor + prototype (and steal `Error.captureStackTrace` while we're at it)
+         * equivalent JS code is roughly
+         * ```
+         * function RubyError() { throw new Error("This class may not be constructed from JS!") }
+         * RubyError.prototype = Object.create(Error.prototype);
+         * RubyError.prototype.name = "RubyError";
+         * RubyError.prototype.constructor = RubyError;
+         * ```
+         */
+        Local<Object> global = context->Global();
+        Local<Object> errorConstructor = global
+            ->Get(context, String::NewFromUtf8(isolate_info->isolate, "Error").ToLocalChecked())
+            .ToLocalChecked().As<Object>();
+        Local<Function> captureStackTrace = errorConstructor
+            ->Get(context, String::NewFromUtf8(isolate_info->isolate, "captureStackTrace").ToLocalChecked())
+            .ToLocalChecked().As<Function>();
+        context_info->capture_stack_trace.Reset(isolate_info->isolate, captureStackTrace);
+        Local<Value> errorPrototype = errorConstructor
+            ->Get(context, String::NewFromUtf8(isolate_info->isolate, "prototype").ToLocalChecked())
+            .ToLocalChecked();
+
+        Local<Object> rubyErrorProto = Object::New(isolate_info->isolate, errorPrototype, nullptr, nullptr, (size_t) 0);
+        rubyErrorProto->Set(context, String::NewFromUtf8(isolate_info->isolate, "name").ToLocalChecked(), strClassName).Check();
+
+        Local<FunctionTemplate> rubyErrorConstructorTemplate = FunctionTemplate::New(isolate_info->isolate, NoRubyErrorConstructor);
+        rubyErrorConstructorTemplate->SetClassName(strClassName);
+        Local<Function> rubyErrorConstructor = rubyErrorConstructorTemplate->GetFunction(context).ToLocalChecked();
+        rubyErrorConstructor->Set(context, String::NewFromUtf8(isolate_info->isolate, "prototype").ToLocalChecked(), rubyErrorProto).Check();
+        rubyErrorProto->Set(context, String::NewFromUtf8(isolate_info->isolate, "constructor").ToLocalChecked(), rubyErrorConstructor).Check();
+        context_info->ruby_error_prototype.Reset(isolate_info->isolate, rubyErrorProto);
+        global->Set(context, strClassName, rubyErrorConstructor).Check();
     }
 
     if (Qnil == rb_cDateTime && rb_funcall(rb_cObject, rb_intern("const_defined?"), 1, rb_str_new2("DateTime")) == Qtrue)
@@ -1216,6 +1265,31 @@ VALUE rescue_callback(VALUE rdata, VALUE exception) {
     return exception;
 }
 
+static void throw_ruby_error(Isolate* isolate, ContextInfo* context_info, VALUE rb_error) {
+        VALUE message = rb_funcall(rb_error, rb_intern("message"), 0);
+	HandleScope scope { isolate };
+
+	Local<ObjectTemplate> errorTemplate = context_info->isolate_info->ruby_error_template.Get(isolate);
+	Local<Object> errorInstance;
+	Local<Context> context = context_info->context->Get(isolate);
+	if(!errorTemplate->NewInstance(context).ToLocal(&errorInstance))
+		return;
+	/* TODO: Is this cast sane? */
+	errorInstance->SetInternalField(0, External::New(isolate, (void*) rb_error));
+	if(errorInstance->SetPrototype(context, context_info->ruby_error_prototype.Get(isolate)).IsNothing())
+		return;
+	Local<String> v8Message;
+	if(!String::NewFromUtf8(isolate, RSTRING_PTR(message), NewStringType::kNormal, RSTRING_LENINT(message)).ToLocal(&v8Message))
+		v8Message = String::NewFromUtf8(isolate, "(( exception message was too long, dropped ))").ToLocalChecked();
+	if(errorInstance->Set(context, String::NewFromUtf8(isolate, "message").ToLocalChecked(), v8Message).IsNothing())
+		return;
+	Local<Value> captureTarget = errorInstance;
+	if(context_info->capture_stack_trace.Get(isolate)->Call(context, v8::Undefined(isolate), 1, &captureTarget).IsEmpty())
+		return;
+
+	isolate->ThrowException(errorInstance);
+}
+
 static void*
 gvl_ruby_callback(void* data) {
 
@@ -1280,9 +1354,9 @@ gvl_ruby_callback(void* data) {
             MR_METHOD_FUNC(rescue_callback), callback_data_value, rb_eException, (VALUE)0);
 
     if(callback_data.failed) {
+        /* TODO: Use the v8 exception as a data storage instead */
         rb_iv_set(parent, "@current_exception", result);
-        VALUE message = rb_funcall(result, rb_intern("message"), 0);
-        args->GetIsolate()->ThrowException(String::NewFromUtf8(args->GetIsolate(), RSTRING_PTR(message), NewStringType::kNormal, RSTRING_LENINT(message)).ToLocalChecked());
+        throw_ruby_error(args->GetIsolate(), context_info, result);
     }
     else {
         HandleScope scope(args->GetIsolate());
@@ -1428,6 +1502,7 @@ IsolateInfo::~IsolateInfo() {
 				"MiniRacer::Platform.set_flags! :single_threaded\n"
 				);
             } else {
+                this->ruby_error_template.Reset();
                 isolate->Dispose();
             }
         }
