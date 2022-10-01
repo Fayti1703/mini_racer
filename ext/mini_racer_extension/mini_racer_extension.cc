@@ -1032,7 +1032,7 @@ static VALUE rb_context_init_unsafe(VALUE self, VALUE isolate, VALUE snap) {
         context_info->context = new Persistent<Context>();
         context_info->context->Reset(isolate_info->isolate, context);
 
-        Local<String> strClassName = String::NewFromUtf8(isolate_info->isolate, "RubyError").ToLocalChecked();
+        Local<String> strClassName = String::NewFromUtf8Literal(isolate_info->isolate, "RubyError");
 
         /* Create `RubyError` constructor + prototype (and steal `Error.captureStackTrace` while we're at it)
          * equivalent JS code is roughly
@@ -1045,24 +1045,24 @@ static VALUE rb_context_init_unsafe(VALUE self, VALUE isolate, VALUE snap) {
          */
         Local<Object> global = context->Global();
         Local<Object> errorConstructor = global
-            ->Get(context, String::NewFromUtf8(isolate_info->isolate, "Error").ToLocalChecked())
+            ->Get(context, String::NewFromUtf8Literal(isolate_info->isolate, "Error"))
             .ToLocalChecked().As<Object>();
         Local<Function> captureStackTrace = errorConstructor
-            ->Get(context, String::NewFromUtf8(isolate_info->isolate, "captureStackTrace").ToLocalChecked())
+            ->Get(context, String::NewFromUtf8Literal(isolate_info->isolate, "captureStackTrace"))
             .ToLocalChecked().As<Function>();
         context_info->capture_stack_trace.Reset(isolate_info->isolate, captureStackTrace);
         Local<Value> errorPrototype = errorConstructor
-            ->Get(context, String::NewFromUtf8(isolate_info->isolate, "prototype").ToLocalChecked())
+            ->Get(context, String::NewFromUtf8Literal(isolate_info->isolate, "prototype"))
             .ToLocalChecked();
 
         Local<Object> rubyErrorProto = Object::New(isolate_info->isolate, errorPrototype, nullptr, nullptr, (size_t) 0);
-        rubyErrorProto->Set(context, String::NewFromUtf8(isolate_info->isolate, "name").ToLocalChecked(), strClassName).Check();
+        rubyErrorProto->Set(context, String::NewFromUtf8Literal(isolate_info->isolate, "name"), strClassName).Check();
 
         Local<FunctionTemplate> rubyErrorConstructorTemplate = FunctionTemplate::New(isolate_info->isolate, NoRubyErrorConstructor);
         rubyErrorConstructorTemplate->SetClassName(strClassName);
         Local<Function> rubyErrorConstructor = rubyErrorConstructorTemplate->GetFunction(context).ToLocalChecked();
-        rubyErrorConstructor->Set(context, String::NewFromUtf8(isolate_info->isolate, "prototype").ToLocalChecked(), rubyErrorProto).Check();
-        rubyErrorProto->Set(context, String::NewFromUtf8(isolate_info->isolate, "constructor").ToLocalChecked(), rubyErrorConstructor).Check();
+        rubyErrorConstructor->Set(context, String::NewFromUtf8Literal(isolate_info->isolate, "prototype"), rubyErrorProto).Check();
+        rubyErrorProto->Set(context, String::NewFromUtf8Literal(isolate_info->isolate, "constructor"), rubyErrorConstructor).Check();
         context_info->ruby_error_prototype.Reset(isolate_info->isolate, rubyErrorProto);
         global->Set(context, strClassName, rubyErrorConstructor).Check();
     }
