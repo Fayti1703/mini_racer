@@ -28,6 +28,7 @@ public:
     bool added_gc_cb;
     pid_t pid;
     VALUE mutex;
+    Global<ObjectTemplate> ruby_error_template;
 
     class Lock {
         VALUE &mutex;
@@ -898,6 +899,12 @@ void IsolateInfo::init(SnapshotInfo* snapshot_info) {
     }
 
     isolate = Isolate::New(create_params);
+
+    Locker lock { isolate };
+    HandleScope scope { isolate };
+    Local<ObjectTemplate> rubyErrorTemplate = ObjectTemplate::New(isolate);
+    rubyErrorTemplate->SetInternalFieldCount(1);
+    this->ruby_error_template.Reset(isolate, rubyErrorTemplate);
 }
 
 static VALUE rb_isolate_init_with_snapshot(VALUE self, VALUE snapshot) {
@@ -1000,6 +1007,7 @@ static VALUE rb_context_init_unsafe(VALUE self, VALUE isolate, VALUE snap) {
         //  RubyError.prototype.name = "RubyError";
         //  RubyError.prototype.constructor = RubyError;
         //  ```
+        Local<String> strClassName = String::NewFromUtf8(isolate_info->isolate, "RubyError").ToLocalChecked();
         Local<Object> global = context->Global();
         Local<Object> errorConstructor = global
             ->Get(context, String::NewFromUtf8Literal(isolate_info->isolate, "Error"))
@@ -1012,9 +1020,8 @@ static VALUE rb_context_init_unsafe(VALUE self, VALUE isolate, VALUE snap) {
             ->Get(context, String::NewFromUtf8Literal(isolate_info->isolate, "prototype"))
             .ToLocalChecked();
 
-        Local<String> strClassName = String::NewFromUtf8Literal(isolate_info->isolate, "RubyError");
-        Local<Object> rubyErrorProto = Object::New(isolate_info->isolate, errorPrototype, nullptr, nullptr, 0);
-        rubyErrorProto->Set(context, String::NewFromUtf8Literal(isolate_info->isolate, "name"), strClassName).Check();
+        Local<Object> rubyErrorProto = Object::New(isolate_info->isolate, errorPrototype, nullptr, nullptr, (size_t) 0);
+        rubyErrorProto->Set(context, String::NewFromUtf8(isolate_info->isolate, "name").ToLocalChecked(), strClassName).Check();
 
         Local<FunctionTemplate> rubyErrorConstructorTemplate = FunctionTemplate::New(isolate_info->isolate, NoRubyErrorConstructor);
         rubyErrorConstructorTemplate->SetClassName(strClassName);
@@ -1229,8 +1236,14 @@ static void throw_ruby_error(Isolate* isolate, ContextInfo* context_info, VALUE 
     VALUE message = rb_funcall(rb_error, rb_intern("message"), 0);
 	HandleScope scope { isolate };
 
-	Local<Object> errorInstance = Object::New(isolate, context_info->ruby_error_prototype.Get(isolate), nullptr, nullptr, 0);
+	Local<ObjectTemplate> errorTemplate = context_info->isolate_info->ruby_error_template.Get(isolate);
+	Local<Object> errorInstance;
 	Local<Context> context = context_info->context->Get(isolate);
+	if(!errorTemplate->NewInstance(context).ToLocal(&errorInstance))
+		return;
+	errorInstance->SetInternalField(0, External::New(isolate, (void*) rb_error));
+	if(errorInstance->SetPrototype(context, context_info->ruby_error_prototype.Get(isolate)).IsNothing())
+		return;
 	Local<String> v8Message;
 	if(!String::NewFromUtf8(isolate, RSTRING_PTR(message), NewStringType::kNormal, RSTRING_LENINT(message)).ToLocal(&v8Message))
 		v8Message = String::NewFromUtf8(isolate, "(( exception message was too long, dropped ))").ToLocalChecked();
