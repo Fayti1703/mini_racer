@@ -835,6 +835,7 @@ StartupData warm_up_snapshot_data_blob(StartupData cold_snapshot_blob,
         SnapshotCreator snapshot_creator(nullptr, &cold_snapshot_blob);
         Isolate *isolate = snapshot_creator.GetIsolate();
         {
+            Locker guard { isolate };
             HandleScope scope(isolate);
             Local<Context> context = Context::New(isolate);
             if (!run_extra_code(isolate, context, warmup_source, "<warm-up>")) {
@@ -842,6 +843,7 @@ StartupData warm_up_snapshot_data_blob(StartupData cold_snapshot_blob,
             }
         }
         {
+            Locker guard { isolate };
             HandleScope handle_scope(isolate);
             isolate->ContextDisposedNotification(false);
             Local<Context> context = Context::New(isolate);
